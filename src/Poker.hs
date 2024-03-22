@@ -1,14 +1,36 @@
-module Poker where
+module Poker
+  ( Suit (..),
+    Rank (..),
+    Card (..),
+    Combination (..),
+    Chip (..),
+    Role (..),
+    Play (..),
+    Player (..),
+    Poker (..),
+    startGame,
+    nextGame,
+    nextRound,
+    play,
+    getCombinations,
+    getWinner,
+    getPlays,
+    getRole,
+    getChips,
+  )
+where
 
+import Data.Aeson (FromJSON, ToJSON)
 import Data.List (findIndex, maximumBy, sortBy)
 import Data.List.Split (chunksOf)
 import Data.Map qualified as M
+import Data.Maybe (fromJust)
 import Data.Ord (Down (Down), comparing)
+import GHC.Generics (Generic)
 import System.Random qualified as R
 import System.Random.Shuffle qualified as RS
-import GHC.Generics (Generic)
-import Data.Aeson (ToJSON, FromJSON)
-import Data.Maybe (fromJust)
+
+-- This section defines types
 
 data Suit where
   Clubs :: Suit
@@ -116,13 +138,21 @@ data Play = Fold | Check | Open Int | Call Int | Raise Int | AllIn Int deriving 
 data Status = Init | Folded | Bet Int | AllIned Int deriving (Eq, Show, Generic)
 
 instance ToJSON Chip
+
 instance ToJSON Role
+
 instance ToJSON Play
+
 instance ToJSON Status
+
 instance ToJSON Suit
+
 instance ToJSON Rank
+
 instance ToJSON Card
+
 instance ToJSON Combination
+
 instance ToJSON Player
 
 instance FromJSON Play
@@ -145,83 +175,222 @@ data Poker = Poker
   }
   deriving (Show)
 
-dealCards :: Poker -> Poker
-dealCards p =
-  let (dealt, deck') = deal (2 * length (players p)) (deck p)
-   in p {deck = deck', players = dealToPlayers dealt (players p)}
+-- this section defines exported functions changing the game state
+
+startGame :: [String] -> IO (Maybe Poker)
+startGame usernames = do
+  p <- initPoker usernames
+  return $ initGame p
   where
-    dealToPlayers cards players = zipWith (\p' c -> p' {cards = c}) players (chunksOf 2 cards)
+    initPoker :: [String] -> IO Poker
+    initPoker names = do
+      deck <- shuffle
+      return
+        Poker
+          { deck = deck,
+            players = map initPlayer names,
+            currentBet = 0,
+            bank = M.empty,
+            table = [],
+            playerIdx = 0
+          }
+    initPlayer :: String -> Player
+    initPlayer username =
+      Player
+        { name = username,
+          chips = 500,
+          cards = [],
+          status = Init
+        }
+
+nextGame :: Poker -> IO (Maybe Poker)
+nextGame poker = do
+  deck <- shuffle
+  let poker' = giveBank (fromJust $ getWinner poker) poker'
+  return $
+    initGame
+      poker'
+        { deck = deck,
+          players = map resetStatus $ rotatePlayers $ players poker',
+          currentBet = 0,
+          bank = M.empty,
+          table = [],
+          playerIdx = 0
+        }
+  where
+    resetStatus :: Player -> Player
+    resetStatus player = player {status = Init}
+    rotatePlayers :: [Player] -> [Player]
+    rotatePlayers [] = undefined
+    rotatePlayers (p' : rest) = rest ++ [p']
+    giveBank :: String -> Poker -> Poker
+    giveBank winnerName p = p {players = players''}
+      where
+        winnerIdx = fromJust $ findIndex (\pl -> name pl == winnerName) (players p)
+        winner = players p !! winnerIdx
+        winner' = winner {chips = chips winner + sum (map snd (M.toList (bank poker)))}
+        players'' = concat [take winnerIdx (players poker), [winner'], drop (winnerIdx + 1) (players poker)]
+
+nextRound :: Poker -> Maybe Poker
+nextRound p = case table p of
+  [] ->
+    let (dealt, deck') = deal 3 (deck p)
+     in postprocess $ p {deck = deck', table = dealt}
+  t
+    | length t == 3 ->
+        let (dealt, deck') = deal 1 (deck p)
+         in postprocess $ p {deck = deck', table = t ++ dealt}
+  t
+    | length t == 4 ->
+        let (dealt, deck') = deal 1 (deck p)
+         in postprocess $ p {deck = deck', table = t ++ dealt}
+  _other -> Nothing
+  where
+    resetStatus p' = p' {players = players'}
+      where
+        resetStatus' Folded = Folded
+        resetStatus' _ = Init
+        players' = map (\pl -> pl {status = resetStatus' (status pl)}) (players p)
+    postprocess p' = Just $ (resetStatus p') {currentBet = 0, playerIdx = 0}
+
+play :: Play -> Poker -> Poker
+play pl p = case pl of
+  Fold -> skipFolded $ p {players = playersFold (playerIdx p) (players p)}
+  Check -> skipFolded $ movePlayer p
+  Open bet -> go bet p
+  Call bet -> go bet p
+  Raise bet -> go bet p
+  AllIn bet -> go bet p
+  where
+    go bet' p' =
+      skipFolded $
+        movePlayer $
+          p'
+            { players = playersBet bet' (playerIdx p') (players p'),
+              currentBet = bet' + currentBet p'
+            }
+    playersFold :: Int -> [Player] -> [Player]
+    playersFold idx players = take idx players ++ [player'] ++ drop (idx + 1) players
+      where
+        player = players !! idx
+        player' = player {status = Folded}
+    playersBet :: Int -> Int -> [Player] -> [Player]
+    playersBet bet idx players = take idx players ++ [player'] ++ drop (idx + 1) players
+      where
+        player = players !! idx
+        player' = player {status = Bet bet}
+
+-- This section defines exported functions used to inspect game state
+
+getCombinations :: Poker -> Maybe [(String, Combination)]
+getCombinations p =
+  if isRoundEnd p
+    then Just $ zip (map name $ players p) $ map (determineCombination (table p)) (players p)
+    else Nothing
+  where
+    determineCombination :: [Card] -> Player -> Combination
+    determineCombination table player = go getters getHighCard Nothing (sortBy (comparing Down) $ table ++ cards player)
+      where
+        go :: [[Card] -> Maybe Combination] -> ([Card] -> Combination) -> Maybe Combination -> [Card] -> Combination
+        go [] lf Nothing c = lf c
+        go [] _ (Just combo) _ = combo
+        go (f : fs) lf pc c = case pc of
+          Just combo -> combo
+          Nothing -> go fs lf (f c) c
+        getters :: [[Card] -> Maybe Combination]
+        getters =
+          [ getRoyalFlush,
+            getStraightFlush,
+            getFourOfAKind,
+            getFullHouse,
+            getFlush,
+            getStraight,
+            getThreeOfAKind,
+            getTwoPair,
+            getPair
+          ]
+    isRoundEnd :: Poker -> Bool
+    isRoundEnd p' =
+      let bets = map getBet $ filter isBet $ map status (players p')
+       in all (uncurry (==)) $ zip bets (tail bets)
+      where
+        isBet :: Status -> Bool
+        isBet (Bet _) = True
+        isBet _ = False
+        getBet :: Status -> Int
+        getBet (Bet bet) = bet
+        getBet _ = undefined
+
+getWinner :: Poker -> Maybe String
+getWinner poker =
+  case getCombinations poker of
+    Just cs -> Just $ fst $ maximumBy (\x y -> compare (snd x) (snd y)) cs
+    Nothing -> name <$> getWinnerByFold poker
+  where
+    getWinnerByFold :: Poker -> Maybe Player
+    getWinnerByFold p = case nonFolded of
+      [] -> undefined
+      [x] -> Just x
+      _more -> Nothing
+      where
+        nonFolded = filter (\pl -> status pl /= Folded) (players p)
+
+getPlays :: Poker -> [Play]
+getPlays p = case status player of
+  Init -> [Check, Open 0, AllIn (chips player)]
+  Folded -> []
+  AllIned _ -> []
+  Bet bet -> case currentBet p of
+    0 -> [Check, AllIn (chips player), Open 0]
+    shared ->
+      if shared == bet
+        then [Check, Raise 0, AllIn (chips player)]
+        else
+          if shared - bet >= chips player
+            then [Fold, AllIn (chips player)]
+            else [Fold, Call shared]
+  where
+    player = players p !! playerIdx p
+
+getRole :: Player -> Poker -> Role
+getRole player poker = getRole' (fromJust $ findIndex (\pl -> name pl == name player) (players poker)) poker
+  where
+    getRole' 0 _ = SmallBlind
+    getRole' 1 _ = BigBlind
+    getRole' idx p =
+      if (length (players p) > 2) && (idx == length (players p) - 1) then Dealer else None
+
+getChips :: Player -> [Chip]
+getChips player =
+  concat
+    [ replicate (num `div` 50) C50,
+      replicate ((num `mod` 50) `div` 25) C25,
+      replicate ((num `mod` 25) `div` 10) C10,
+      replicate ((num `mod` 10) `div` 5) C5
+    ]
+  where
+    num = chips player
+
+-- This section defineds unexported utility functions
 
 deal :: Int -> [Card] -> ([Card], [Card])
 deal = splitAt
 
-nextGame :: Poker -> IO (Maybe Poker)
-nextGame p = do
-  deck <- shuffle
-  let newP =
-        startGame
-          p
-            { deck = deck,
-              bank = M.empty,
-              currentBet = 0,
-              table = [],
-              playerIdx = 0,
-              players = map resetStatus $ rotatePlayers $ players p
-            }
-  if isPlayable newP then return (Just newP) else return Nothing
-
-resetStatus :: Player -> Player
-resetStatus player = player { status = Init }
-
-nextRound :: Poker -> Poker
-nextRound p = case table p of
-  [] ->
-    let (dealt, deck') = deal 3 (deck p)
-     in p {deck = deck', table = dealt}
-  t
-    | length t == 3 ->
-        let (dealt, deck') = deal 1 (deck p)
-         in p {deck = deck', table = t ++ dealt}
-  t
-    | length t == 4 ->
-        let (dealt, deck') = deal 1 (deck p)
-         in p {deck = deck', table = t ++ dealt}
-  _other -> undefined
-
-isPlayable :: Poker -> Bool
-isPlayable p =
-  length (players p) > 1 && chips (head $ players p) >= 5 && chips (head $ tail $ players p) >= 10
-
-determineWinner :: Poker -> Int
-determineWinner p = fst $ maximumBy (\x y -> compare (snd x) (snd y)) idxCombos
-  where
-    combinations = map (determineCombination (table p)) (players p)
-    idxCombos = zip [0 ..] combinations
-
-getCombinations :: Poker -> [(String, Combination)]
-getCombinations p = zip (map name $ players p) $ map (determineCombination (table p)) (players p)
-
-determineCombination :: [Card] -> Player -> Combination
-determineCombination table player = go getters getHighCard Nothing (sortBy (comparing Down) $ table ++ cards player)
-  where
-    go :: [[Card] -> Maybe Combination] -> ([Card] -> Combination) -> Maybe Combination -> [Card] -> Combination
-    go [] lf Nothing c = lf c
-    go [] _ (Just combo) _ = combo
-    go (f : fs) lf pc c = case pc of
-      Just combo -> combo
-      Nothing -> go fs lf (f c) c
-    getters :: [[Card] -> Maybe Combination]
-    getters =
-      [ getRoyalFlush,
-        getStraightFlush,
-        getFourOfAKind,
-        getFullHouse,
-        getFlush,
-        getStraight,
-        getThreeOfAKind,
-        getTwoPair,
-        getPair
-      ]
+isDescByOne :: Rank -> Rank -> Bool
+isDescByOne Ace King = True
+isDescByOne King Queen = True
+isDescByOne Queen Jack = True
+isDescByOne Jack Ten = True
+isDescByOne Ten Nine = True
+isDescByOne Nine Eight = True
+isDescByOne Eight Seven = True
+isDescByOne Seven Six = True
+isDescByOne Six Five = True
+isDescByOne Five Four = True
+isDescByOne Four Three = True
+isDescByOne Three Two = True
+isDescByOne Two Ace = True
+isDescByOne _ _ = False
 
 getRoyalFlush :: [Card] -> Maybe Combination
 getRoyalFlush (Card s1 Ace : Card s2 King : Card s3 Queen : Card s4 Jack : Card s5 Ten : _) =
@@ -242,22 +411,6 @@ getStraightFlush (highest : rest)
                 else getStraightFlush rest
   where
     go (Card s1 r1, Card s2 r2) = s1 == s2 && isDescByOne r1 r2
-
-isDescByOne :: Rank -> Rank -> Bool
-isDescByOne Ace King = True
-isDescByOne King Queen = True
-isDescByOne Queen Jack = True
-isDescByOne Jack Ten = True
-isDescByOne Ten Nine = True
-isDescByOne Nine Eight = True
-isDescByOne Eight Seven = True
-isDescByOne Seven Six = True
-isDescByOne Six Five = True
-isDescByOne Five Four = True
-isDescByOne Four Three = True
-isDescByOne Three Two = True
-isDescByOne Two Ace = True
-isDescByOne _ _ = False
 
 getFourOfAKind :: [Card] -> Maybe Combination
 getFourOfAKind cards
@@ -383,163 +536,72 @@ getPair cards
 getHighCard :: [Card] -> Combination
 getHighCard cards = HighCard (head cards) (cards !! 1) (cards !! 2) (cards !! 3) (cards !! 4)
 
-rotatePlayers :: [Player] -> [Player]
-rotatePlayers [] = undefined
-rotatePlayers (p : rest) = mappend rest [p]
-
-giveBank :: Player -> Poker -> Poker
-giveBank winner poker = poker {players = players''}
+initGame :: Poker -> Maybe Poker
+initGame p =
+  case tryTakeBlind takeSmallBlind $ dealCards p of
+    Nothing -> Nothing
+    Just sb ->
+      case tryTakeBlind takeBigBlind sb of
+        Nothing -> Nothing
+        Just bb ->
+          if isPlayable bb
+            then Just bb
+            else Nothing
   where
-    winner' = winner {chips = chips winner + sum (map snd (M.toList (bank poker)))}
-    winnerIdx = fromJust $ findIndex (\ p -> name p == name winner) (players poker)
-    players'' = concat [take winnerIdx (players poker), [winner'], drop (winnerIdx + 1) (players poker)]
-
-initPoker :: [String] -> IO Poker
-initPoker usernames = do
-  deck <- shuffle
-  return
-      Poker
-        { deck = deck,
-          players = map initPlayer usernames,
-          currentBet = 0,
-          bank = M.empty,
-          table = [],
-          playerIdx = 0
-        }
-
-startGame :: Poker -> Poker
-startGame = takeBigBlind . takeSmallBlind . dealCards
-
-takeSmallBlind :: Poker -> Poker
-takeSmallBlind p =
-  if chips blind >= 5
-    then
-      p
-        { players = blind' : tail (players p),
-          bank = M.adjust (+ 5) 0 (bank p),
-          playerIdx = playerIdx p + 1
-        }
-    else takeSmallBlind $ p {players = tail (players p)}
-  where
-    blind = head (players p)
-    blind' = blind {chips = chips blind - 5}
-
-takeBigBlind :: Poker -> Poker
-takeBigBlind p =
-  if chips blind >= 10
-    then
-      p
-        { players = head (players p) : blind' : drop 2 (players p),
-          bank = M.adjust (+ 10) 1 (bank p),
-          playerIdx = playerIdx p + 1
-        }
-    else takeBigBlind $ p {players = head (players p) : drop 2 (players p)}
-  where
-    blind = head $ tail $ players p
-    blind' = blind {chips = chips blind - 10}
-
-exchangeChipFor :: Chip -> [Chip] -> [Chip]
-exchangeChipFor chip chips = go chip 0
-  where
-    go :: Chip -> Int -> [Chip]
-    go ch idx
-      | idx >= length chips = chips
-      | (chips !! idx) > ch = exchangeChipFor' ch (chips !! idx)
-      | otherwise = go ch (idx + 1)
-    exchangeChipFor' :: Chip -> Chip -> [Chip]
-    exchangeChipFor' C5 C10 = replicate 2 C5
-    exchangeChipFor' C5 C25 = replicate 5 C5
-    exchangeChipFor' C5 C50 = replicate 10 C5
-    exchangeChipFor' C10 C25 = [C10, C10, C5]
-    exchangeChipFor' C10 C50 = replicate 5 C10
-    exchangeChipFor' C25 C50 = replicate 2 C25
-    exchangeChipFor' _ _ = undefined
-
-initPlayer :: String -> Player
-initPlayer username =
-  Player
-    { name = username,
-      chips = 500,
-      cards = [],
-      status = Init
-    }
-
-getRole :: Int -> Poker -> Role
-getRole 0 _ = SmallBlind
-getRole 1 _ = BigBlind
-getRole idx p =
-  if (length (players p) > 2) && (idx == length (players p) - 1) then Dealer else None
-
-getChips :: Poker -> Int
-getChips p = chips (players p !! playerIdx p)
-
-initChips :: [Chip]
-initChips = concat [replicate 4 C50, replicate 6 C25, replicate 10 C10, replicate 10 C5]
-
-initDeck :: [Card]
-initDeck = map (uncurry Card) $ liftA2 (,) suits ranks
-  where
-    suits = [Clubs, Spades, Hearts, Diamonds]
-    ranks = [Two, Three, Four, Five, Six, Seven, Eight, Nine, Ten, Jack, Queen, King, Ace]
-
-initDeckSize :: Int
-initDeckSize = 52
+    tryTakeBlind :: (Poker -> Maybe Poker) -> Poker -> Maybe Poker
+    tryTakeBlind tb poker =
+      case tb poker of
+        Nothing -> tryTakeBlind tb $ poker {players = tail $ players poker}
+        Just poker' -> Just poker'
+    isPlayable :: Poker -> Bool
+    isPlayable p' =
+      length (players p') > 1 && chips (head $ players p') >= 5 && chips (head $ tail $ players p') >= 10
+    dealCards :: Poker -> Poker
+    dealCards p' =
+      let (dealt, deck') = deal (2 * length (players p')) (deck p')
+       in p' {deck = deck', players = dealToPlayers dealt (players p')}
+      where
+        dealToPlayers cards players = zipWith (\pl c -> pl {cards = c}) players (chunksOf 2 cards)
+    takeSmallBlind :: Poker -> Maybe Poker
+    takeSmallBlind p' =
+      if chips blind >= 5
+        then
+          Just $
+            p'
+              { players = blind' : tail (players p'),
+                bank = M.adjust (+ 5) 0 (bank p'),
+                playerIdx = playerIdx p' + 1
+              }
+        else Nothing
+      where
+        blind = head (players p')
+        blind' = blind {chips = chips blind - 5}
+    takeBigBlind :: Poker -> Maybe Poker
+    takeBigBlind p' =
+      if chips blind >= 10
+        then
+          Just $
+            p'
+              { players = head (players p') : blind' : drop 2 (players p'),
+                bank = M.adjust (+ 10) 1 (bank p'),
+                playerIdx = playerIdx p' + 1
+              }
+        else Nothing
+      where
+        blind = head $ tail $ players p'
+        blind' = blind {chips = chips blind - 10}
 
 shuffle :: IO [Card]
 shuffle = do
   RS.shuffle' initDeck initDeckSize <$> R.initStdGen
-
-play :: Play -> Poker -> Poker
-play pl p = case pl of
-  Fold -> skipFolded $ p {players = playersFold (playerIdx p) (players p)}
-  Check -> skipFolded $ movePlayer p
-  Open bet -> go bet p
-  Call bet -> go bet p
-  Raise bet -> go bet p
-  AllIn bet -> go bet p
   where
-    go bet' p' =
-      skipFolded $
-        movePlayer $
-          p'
-            { players = playersBet bet' (playerIdx p') (players p'),
-              currentBet = bet' + currentBet p'
-            }
-
-toChips :: Int -> [Chip]
-toChips num =
-  concat
-    [ replicate (num `div` 50) C50,
-      replicate ((num `mod` 50) `div` 25) C25,
-      replicate ((num `mod` 25) `div` 10) C10,
-      replicate ((num `mod` 10) `div` 5) C5
-    ]
-
-playersBet :: Int -> Int -> [Player] -> [Player]
-playersBet bet idx players = take idx players ++ [player'] ++ drop (idx + 1) players
-  where
-    player = players !! idx
-    player' = player {status = Bet bet}
-
-getWinnerByFold :: Poker -> Maybe Player
-getWinnerByFold p = case nonFolded of
-    [] -> undefined
-    [x] -> Just x
-    _more -> Nothing
-  where nonFolded = filter (\pl -> status pl /= Folded) (players p)
-
-isRoundEnd :: Poker -> Bool
-isRoundEnd p =
-  let bets = map getBet $ filter isBet $ map status (players p)
-   in all (uncurry (==)) $ zip bets (tail bets)
-
-isBet :: Status -> Bool
-isBet (Bet _) = True
-isBet _ = False
-
-getBet :: Status -> Int
-getBet (Bet bet) = bet
-getBet _ = undefined
+    initDeckSize :: Int
+    initDeckSize = 52
+    initDeck :: [Card]
+    initDeck = map (uncurry Card) $ liftA2 (,) suits ranks
+      where
+        suits = [Clubs, Spades, Hearts, Diamonds]
+        ranks = [Two, Three, Four, Five, Six, Seven, Eight, Nine, Ten, Jack, Queen, King, Ace]
 
 movePlayer :: Poker -> Poker
 movePlayer p = p {playerIdx = (playerIdx p + 1) `mod` length (players p)}
@@ -548,26 +610,3 @@ skipFolded :: Poker -> Poker
 skipFolded p = case status (players p !! playerIdx p) of
   Folded -> skipFolded $ movePlayer p
   _other -> p
-
-playersFold :: Int -> [Player] -> [Player]
-playersFold idx players = take idx players ++ [player'] ++ drop (idx + 1) players
-  where
-    player = players !! idx
-    player' = player {status = Folded}
-
-getPlays :: Poker -> [Play]
-getPlays p = case status player of
-  Init -> [Check, Open 0, AllIn (chips player)]
-  Folded -> []
-  AllIned _ -> []
-  Bet bet -> case currentBet p of
-    0 -> [Check, AllIn (chips player), Open 0]
-    shared ->
-      if shared == bet
-        then [Check, Raise 0, AllIn (chips player)]
-        else
-          if shared - bet >= chips player
-            then [Fold, AllIn (chips player)]
-            else [Fold, Call shared]
-  where
-    player = players p !! playerIdx p
