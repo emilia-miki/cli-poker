@@ -72,7 +72,8 @@ library
                       random,
                       random-shuffle,
                       split,
-                      containers
+                      containers,
+                      aeson
 
     -- Directories containing source files.
     hs-source-dirs:   src
@@ -98,6 +99,13 @@ executable cli-poker-server
         base ^>=4.18.2.0,
         network,
         bytestring,
+        scotty,
+        unliftio-core,
+        mtl,
+        stm,
+        text,
+        containers,
+        aeson,
         cli-poker
 
     -- Directories containing source files.
@@ -124,6 +132,30 @@ executable cli-poker-client
         base ^>=4.18.2.0,
         bytestring,
         network,
+        cli-poker
+
+    -- Directories containing source files.
+    hs-source-dirs:   app
+
+    -- Base language which the package is written in.
+    default-language: GHC2021
+
+executable cli-poker
+    -- Import common warning flags.
+    import:           warnings
+
+    -- .hs or .lhs file containing the Main module.
+    main-is:          CLIGame.hs
+
+    -- Modules included in this executable, other than Main.
+    -- other-modules:
+
+    -- LANGUAGE extensions used by modules in this package.
+    -- other-extensions:
+
+    -- Other library packages from which modules are imported.
+    build-depends:
+        base ^>=4.18.2.0,
         cli-poker
 
     -- Directories containing source files.

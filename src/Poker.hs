@@ -1,18 +1,21 @@
 module Poker where
 
-import Data.List (maximumBy, sortBy)
+import Data.List (findIndex, maximumBy, sortBy)
 import Data.List.Split (chunksOf)
 import Data.Map qualified as M
 import Data.Ord (Down (Down), comparing)
 import System.Random qualified as R
 import System.Random.Shuffle qualified as RS
+import GHC.Generics (Generic)
+import Data.Aeson (ToJSON, FromJSON)
+import Data.Maybe (fromJust)
 
 data Suit where
   Clubs :: Suit
   Spades :: Suit
   Hearts :: Suit
   Diamonds :: Suit
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic)
 
 data Rank where
   Two :: Rank
@@ -28,9 +31,9 @@ data Rank where
   Queen :: Rank
   King :: Rank
   Ace :: Rank
-  deriving (Eq, Ord, Show)
+  deriving (Eq, Ord, Show, Generic)
 
-data Card = Card Suit Rank deriving (Show)
+data Card = Card Suit Rank deriving (Show, Generic)
 
 instance Eq Card where
   (==) (Card _ r1) (Card _ r2) = r1 == r2
@@ -59,7 +62,7 @@ data Combination where
   StraightFlush :: Card -> Combination
   -- No arguments needed
   RoyalFlush :: Suit -> Combination
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic)
 
 instance Ord Combination where
   compare (RoyalFlush _) (RoyalFlush _) = EQ
@@ -104,20 +107,33 @@ instance Ord Combination where
 uCompare :: (Ord a) => [a] -> [a] -> Ordering
 uCompare l1 l2 = compare (sortBy (comparing Down) l1) (sortBy (comparing Down) l2)
 
-data Chip = C5 | C10 | C25 | C50 deriving (Eq, Ord, Show)
+data Chip = C5 | C10 | C25 | C50 deriving (Eq, Ord, Show, Generic)
 
-data Role = Dealer | SmallBlind | BigBlind | None deriving (Show)
+data Role = Dealer | SmallBlind | BigBlind | None deriving (Show, Generic)
 
-data Play = Fold | Check | Open Int | Call Int | Raise Int | AllIn Int deriving (Show)
+data Play = Fold | Check | Open Int | Call Int | Raise Int | AllIn Int deriving (Eq, Show, Generic)
 
-data Status = Folded | Bet Int | AllIned Int deriving (Eq, Show)
+data Status = Init | Folded | Bet Int | AllIned Int deriving (Eq, Show, Generic)
+
+instance ToJSON Chip
+instance ToJSON Role
+instance ToJSON Play
+instance ToJSON Status
+instance ToJSON Suit
+instance ToJSON Rank
+instance ToJSON Card
+instance ToJSON Combination
+instance ToJSON Player
+
+instance FromJSON Play
 
 data Player = Player
-  { chips :: Int,
+  { name :: String,
+    chips :: Int,
     cards :: [Card],
     status :: Status
   }
-  deriving (Show)
+  deriving (Show, Generic)
 
 data Poker = Poker
   { deck :: [Card],
@@ -142,21 +158,23 @@ deal = splitAt
 nextGame :: Poker -> IO (Maybe Poker)
 nextGame p = do
   deck <- shuffle
-  let winner = determineWinner p
   let newP =
-        startRound
+        startGame
           p
             { deck = deck,
               bank = M.empty,
               currentBet = 0,
               table = [],
               playerIdx = 0,
-              players = rotatePlayers $ giveBank (bank p) winner (players p)
+              players = map resetStatus $ rotatePlayers $ players p
             }
   if isPlayable newP then return (Just newP) else return Nothing
 
-nextTurn :: Poker -> Poker
-nextTurn p = case table p of
+resetStatus :: Player -> Player
+resetStatus player = player { status = Init }
+
+nextRound :: Poker -> Poker
+nextRound p = case table p of
   [] ->
     let (dealt, deck') = deal 3 (deck p)
      in p {deck = deck', table = dealt}
@@ -179,6 +197,9 @@ determineWinner p = fst $ maximumBy (\x y -> compare (snd x) (snd y)) idxCombos
   where
     combinations = map (determineCombination (table p)) (players p)
     idxCombos = zip [0 ..] combinations
+
+getCombinations :: Poker -> [(String, Combination)]
+getCombinations p = zip (map name $ players p) $ map (determineCombination (table p)) (players p)
 
 determineCombination :: [Card] -> Player -> Combination
 determineCombination table player = go getters getHighCard Nothing (sortBy (comparing Down) $ table ++ cards player)
@@ -366,31 +387,28 @@ rotatePlayers :: [Player] -> [Player]
 rotatePlayers [] = undefined
 rotatePlayers (p : rest) = mappend rest [p]
 
-giveBank :: M.Map Int Int -> Int -> [Player] -> [Player]
-giveBank bank winner players = concat [take winner players, [winnerPlayer'], drop (winner + 1) players]
+giveBank :: Player -> Poker -> Poker
+giveBank winner poker = poker {players = players''}
   where
-    winnerPlayer = players !! winner
-    winnerPlayer' = winnerPlayer {chips = chips winnerPlayer + sum (map snd (M.toList bank))}
+    winner' = winner {chips = chips winner + sum (map snd (M.toList (bank poker)))}
+    winnerIdx = fromJust $ findIndex (\ p -> name p == name winner) (players poker)
+    players'' = concat [take winnerIdx (players poker), [winner'], drop (winnerIdx + 1) (players poker)]
 
-initPoker :: Int -> IO (Maybe Poker)
-initPoker n = do
-  if n > 1
-    then do
-      deck <- shuffle
-      return $
-        Just
-          Poker
-            { deck = deck,
-              players = initPlayers n,
-              currentBet = 0,
-              bank = M.empty,
-              table = [],
-              playerIdx = 0
-            }
-    else return Nothing
+initPoker :: [String] -> IO Poker
+initPoker usernames = do
+  deck <- shuffle
+  return
+      Poker
+        { deck = deck,
+          players = map initPlayer usernames,
+          currentBet = 0,
+          bank = M.empty,
+          table = [],
+          playerIdx = 0
+        }
 
-startRound :: Poker -> Poker
-startRound = takeBigBlind . takeSmallBlind . dealCards
+startGame :: Poker -> Poker
+startGame = takeBigBlind . takeSmallBlind . dealCards
 
 takeSmallBlind :: Poker -> Poker
 takeSmallBlind p =
@@ -437,15 +455,13 @@ exchangeChipFor chip chips = go chip 0
     exchangeChipFor' C25 C50 = replicate 2 C25
     exchangeChipFor' _ _ = undefined
 
-initPlayers :: Int -> [Player]
-initPlayers n = replicate n initPlayer
-
-initPlayer :: Player
-initPlayer =
+initPlayer :: String -> Player
+initPlayer username =
   Player
-    { chips = 500,
+    { name = username,
+      chips = 500,
       cards = [],
-      status = Bet 0
+      status = Init
     }
 
 getRole :: Int -> Poker -> Role
@@ -505,8 +521,12 @@ playersBet bet idx players = take idx players ++ [player'] ++ drop (idx + 1) pla
     player = players !! idx
     player' = player {status = Bet bet}
 
-isWon :: Poker -> Bool
-isWon p = length (filter (\pl -> status pl /= Folded) (players p)) == 1
+getWinnerByFold :: Poker -> Maybe Player
+getWinnerByFold p = case nonFolded of
+    [] -> undefined
+    [x] -> Just x
+    _more -> Nothing
+  where nonFolded = filter (\pl -> status pl /= Folded) (players p)
 
 isRoundEnd :: Poker -> Bool
 isRoundEnd p =
@@ -537,6 +557,7 @@ playersFold idx players = take idx players ++ [player'] ++ drop (idx + 1) player
 
 getPlays :: Poker -> [Play]
 getPlays p = case status player of
+  Init -> [Check, Open 0, AllIn (chips player)]
   Folded -> []
   AllIned _ -> []
   Bet bet -> case currentBet p of

@@ -6,7 +6,6 @@ import Control.Exception qualified as E
 import Data.ByteString.Char8 qualified as C
 import Network.Socket
 import Network.Socket.ByteString (recv, sendAll)
-import Poker qualified (someFunc)
 
 main :: IO ()
 main = runTCPClient "127.0.0.1" "3000" $ \s -> do
